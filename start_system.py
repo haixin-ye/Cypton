@@ -10,7 +10,7 @@ FRONTEND_SCRIPT = "dashboard.py"
 
 
 def run_system():
-    print(f"🚀 正在启动 AI 交易全栈系统...")
+    print(f"🚀 正在启动...")
     print(f"📂 当前解释器路径: {sys.executable}")
 
     # 1. 启动后端 (数据引擎)
@@ -35,9 +35,8 @@ def run_system():
     )
 
     print("\n✅ 系统启动成功！")
-    print("   后端正在后台搬砖...")
-    print("   前端网页即将自动弹出...")
-    print("\n[按 Ctrl+C 可以一键关闭所有程序]")
+
+    # print("\n[按 Ctrl+C 可以一键关闭所有程序]")
 
     try:
         # 主进程进入死循环，等待用户按 Ctrl+C
