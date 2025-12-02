@@ -44,10 +44,10 @@ def calculate_indicators(df):
 # ================= 🔌 第一步：历史数据预热 =================
 def init_history():
     """
-    在建立 WebSocket 连接前，先用 REST API 拉取历史数据。
-    作用：确保程序启动后的第一秒，MACD/EMA 等依赖历史的指标就是准确的。
+    策略：过量预取 + 尾部截断
+    确保拿到的一定是【包含当前最新K线】的最后 LIMIT 条数据
     """
-    print(f"⏳ 正在初始化历史数据 ({config.SYMBOL_REST})...")
+    print(f"⏳ 正在初始化历史数据 (目标: {config.LIMIT} 条, 确保最新)...")
 
     okx = ccxt.okx({
         'proxies': {
@@ -60,25 +60,75 @@ def init_history():
     for tf in config.TIMEFRAMES:
         print(f"   -> 拉取 {tf} ... ", end="")
         try:
-            # 这里的 timeframe 格式需要适配 ccxt，config里配的是统一的
-            bars = okx.fetch_ohlcv(config.SYMBOL_REST, timeframe=tf, limit=config.LIMIT)
-            if not bars:
+            # 1. 计算【超量】起始时间
+            # 我们多预留 50% 的时间缓冲，防止中间有停盘/缺数据导致拉不到最新
+            duration_seconds = okx.parse_timeframe(tf)
+            # 比如要1000根，我们按1500根的时间跨度去请求
+            lookback_count = int(config.LIMIT * 1.5)
+            time_span_ms = duration_seconds * 1000 * lookback_count
+
+            start_timestamp = okx.milliseconds() - time_span_ms
+
+            all_ohlcv = []
+            current_since = start_timestamp
+
+            # 2. 循环拉取，直到【没有新数据】为止
+            while True:
+                # 每次请求 100 条 (OKX 某些接口限制较严，用 100 比较稳，反正循环很快)
+                limit_per_req = 100
+
+                candles = okx.fetch_ohlcv(config.SYMBOL_REST, timeframe=tf, since=current_since, limit=limit_per_req)
+
+                if not candles:
+                    break  # 真的没数据了，退出
+
+                # 数据拼接
+                if not all_ohlcv:
+                    all_ohlcv = candles
+                else:
+                    last_ts = all_ohlcv[-1][0]
+                    # 过滤掉时间戳重复或旧的数据
+                    new_candles = [c for c in candles if c[0] > last_ts]
+                    if not new_candles:
+                        break  # 虽然有返回，但都是旧数据，说明到头了
+                    all_ohlcv.extend(new_candles)
+
+                # 3. 核心判断：是否已经拉到了"未来"或"现在"？
+                # 如果这次拉回来的数量少于 limit_per_req，说明已经是最后一页了
+                if len(candles) < limit_per_req:
+                    break
+
+                # 更新下次起点
+                current_since = all_ohlcv[-1][0] + 1
+                time.sleep(0.05)  # 极短休眠避免触发频率限制
+
+            # 4. 【尾部截断】：只保留最后(最新)的 LIMIT 条
+            if len(all_ohlcv) > config.LIMIT:
+                all_ohlcv = all_ohlcv[-config.LIMIT:]
+
+            if not all_ohlcv:
                 print("❌ 空数据")
                 continue
 
-            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            # 5. 【时效性校验】：检查最后一条数据的时间是否新鲜
+            last_candle_time = datetime.fromtimestamp(all_ohlcv[-1][0] / 1000)
+            now_time = datetime.now()
+            # 简单打印一下最后一条K线的时间，让你放心
+            time_str = last_candle_time.strftime('%H:%M:%S')
+
+            # 转 DataFrame
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df = calculate_indicators(df)
 
             with DATA_LOCK:
                 DATA_CACHE[tf] = df
-            print(f"✅ 完成 ({len(df)} 根)")
+
+            print(f"✅ 完成 (获 {len(df)} 根 | 最新: {time_str})")
 
         except Exception as e:
             print(f"❌ 失败: {e}")
-            # 初始化失败不能退出，后续靠 WebSocket 慢慢补也可以，但指标前期会不准
 
     print("🚀 历史数据预热完毕，准备接入实时流...")
-
 
 # ================= 📡 第二步：WebSocket 实时处理 =================
 
@@ -202,8 +252,8 @@ def start_ws_loop():
         except Exception as e:
             print(f"❌ 启动失败: {e}")
 
-        print("🔁 5秒后尝试重连...")
-        time.sleep(5)
+        print("🔁 2秒后尝试重连...")
+        time.sleep(2)
 
 
 # ================= 💾 第三步：定时落盘 =================

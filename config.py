@@ -11,7 +11,7 @@ SYMBOL_REST = "ETH/USDT:USDT"
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
 # 保留的数据长度
-LIMIT = 1000
+LIMIT = 800
 
 # ================= ⚙️ 网络配置 =================
 PROXY_HOST = "127.0.0.1"
