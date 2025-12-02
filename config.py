@@ -11,7 +11,7 @@ SYMBOL_REST = "ETH/USDT:USDT"
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
 # 保留的数据长度
-LIMIT = 800
+LIMIT = 300
 
 # ================= ⚙️ 网络配置 =================
 PROXY_HOST = "127.0.0.1"
@@ -20,4 +20,4 @@ WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
 
 # ================= 💾 输出 =================
 JSON_FILENAME = "market_factory.json"
-WRITE_INTERVAL = 30 # 每5秒强制落盘一次（不管有没有更新，保底）
+WRITE_INTERVAL = 15 # 每5秒强制落盘一次（不管有没有更新，保底）

@@ -21,47 +21,47 @@ DATA_LOCK = threading.RLock()
 
 # ================= 💾 核心功能：数据落盘 =================
 def save_to_disk(reason="定时"):
-    """将内存数据写入磁盘。reason用于区分触发源。"""
     if not DATA_CACHE: return
-
     export_data = {}
     with DATA_LOCK:
         for tf, df in DATA_CACHE.items():
             clean_df = df.fillna(0)
             export_data[tf] = clean_df.to_dict(orient='records')
-
     if not export_data: return
-
     try:
         temp_file = config.JSON_FILENAME + ".tmp"
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(export_data, f)
         os.replace(temp_file, config.JSON_FILENAME)
-
         if reason != "定时":
             print(f"💾 [强行落盘] 触发原因: {reason} | 文件已更新!")
     except Exception as e:
         print(f"❌ 写入失败: {e}")
 
 
-# ================= 🔔 高级预警模块 (支持 Reach) =================
+# ================= 🔔 高级预警模块 (矩阵极简版) =================
 class AlertManager:
     def __init__(self, config_file='alerts.json', flush_callback=None):
         self.config_file = config_file
         self.last_mtime = 0
-        self.alerts = []
+
+        # 规则存储结构：[[price, type, note], ...]
+        self.rules = []
+
+        # 内存中记录已触发的规则，防止重复弹窗
+        # 格式: { "3500_above": True, ... }
+        self.triggered_cache = set()
+
         self.enabled = True
         self.check_interval = 2
         self.last_check_time = 0
         self.flush_callback = flush_callback
-
-        # 定义 "Reach" 类型的容差范围 (0.1%)
-        # 例如目标 3000，只要价格在 2997~3003 之间就算触碰
-        self.tolerance_pct = 0.0005
+        self.tolerance_pct = 0.0003
 
         self.load_config()
 
     def load_config(self):
+        """热加载配置"""
         if not os.path.exists(self.config_file): return
         try:
             current_mtime = os.path.getmtime(self.config_file)
@@ -69,21 +69,38 @@ class AlertManager:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.enabled = data.get('enable', True)
-                    self.alerts = data.get('alerts', [])
+
+                    # ⬇️ 关键修改：读取简化版列表 ⬇️
+                    raw_rules = data.get('rules', [])
+                    self.rules = []
+
+                    # 简单校验一下格式，防止写错
+                    for r in raw_rules:
+                        if isinstance(r, list) and len(r) >= 2:
+                            # 格式化为标准结构 [价格(float), 类型(str), 备注(str)]
+                            try:
+                                p = float(r[0])
+                                t = str(r[1]).strip()
+                                n = str(r[2]) if len(r) > 2 else ""
+                                self.rules.append([p, t, n])
+                            except:
+                                print(f"⚠️ 跳过格式错误的规则: {r}")
+
+                # 如果文件被修改了，我们清空触发缓存，这样你可以重新利用已触发的价格
+                self.triggered_cache.clear()
                 self.last_mtime = current_mtime
-                print(f"🔔 [系统] 预警配置已热更新！规则数: {len(self.alerts)}")
+                print(f"🔔 [系统] 预警配置已刷新！加载 {len(self.rules)} 条规则 (矩阵模式)")
         except Exception as e:
-            print(f"⚠️ 读配置错: {e}")
+            print(f"⚠️ 读取配置出错: {e}")
 
     def play_sound(self):
         try:
             sys_plat = platform.system()
             if sys_plat == "Windows":
                 import winsound
-                # 这种声音比较像 "核弹来袭" 的紧迫感
                 for _ in range(3):
-                    winsound.Beep(800, 200)
-                    winsound.Beep(1200, 200)
+                    winsound.Beep(800, 150)
+                    winsound.Beep(1200, 150)
             elif sys_plat == "Darwin":
                 os.system('afplay /System/Library/Sounds/Glass.aiff')
             else:
@@ -98,22 +115,21 @@ class AlertManager:
             root.attributes('-topmost', True)
             self.play_sound()
 
-            # 根据类型给点幽默的提示
-            title = "行情预警"
-            if rule_type == 'reach':
-                msg_head = "🎯 目标已击中 (Touch)!"
-            elif rule_type == 'above':
-                msg_head = "🚀 火箭发射 (Breakout)!"
-            else:
-                msg_head = "📉 瀑布警报 (Breakdown)!"
+            titles = {
+                'reach': "🎯 目标击中 (Touch)!",
+                'above': "🚀 向上突破 (Breakout)!",
+                'below': "📉 向下跌破 (Breakdown)!"
+            }
+            title = titles.get(rule_type, "行情预警")
 
-            msg = f"{msg_head}\n\n当前价格: {price}\n备注: {note}\n\n(已强行保存最新数据)"
+            msg = f"{title}\n\n触发价格: {price}\n预警设定: {note}\n\n(已强行保存数据)"
             messagebox.showwarning(title, msg)
             root.destroy()
 
         threading.Thread(target=_popup, daemon=True).start()
 
     def check_price(self, current_price):
+        """检查逻辑"""
         now = time.time()
         if now - self.last_check_time > self.check_interval:
             self.load_config()
@@ -123,50 +139,57 @@ class AlertManager:
 
         is_triggered_any = False
 
-        for rule in self.alerts:
-            if rule.get('triggered', False): continue
+        # 遍历所有规则
+        for rule in self.rules:
+            # rule 结构: [price, type, note]
+            target = rule[0]
+            r_type = rule[1]
+            note = rule[2]
 
-            target = rule['price']
-            r_type = rule['type']
-            note = rule.get('note', '')
+            # 生成一个唯一ID，防止重复触发
+            # 例如: "3500.0_above"
+            rule_id = f"{target}_{r_type}"
+
+            if rule_id in self.triggered_cache:
+                continue
 
             triggered = False
 
-            # === 核心判断逻辑 ===
+            # === 判定逻辑 ===
             if r_type == 'above':
                 if current_price >= target:
-                    print(f"🚀 [预警] 价格冲破 {target}! (现价: {current_price})")
+                    print(f"🚀 [预警] 突破 {target}! (现价: {current_price})")
                     triggered = True
 
             elif r_type == 'below':
                 if current_price <= target:
-                    print(f"🔻 [预警] 价格跌穿 {target}! (现价: {current_price})")
+                    print(f"🔻 [预警] 跌破 {target}! (现价: {current_price})")
                     triggered = True
 
             elif r_type == 'reach':
-                # "Reach" 判定：计算百分比差距
-                # 如果 abs(现价 - 目标) / 目标 <= 0.001 (0.1%)
                 diff = abs(current_price - target)
-                threshold = target * self.tolerance_pct
-                if diff <= threshold:
-                    print(f"🎯 [预警] 价格触碰 {target} (范围内)! (现价: {current_price})")
+                if diff <= (target * self.tolerance_pct):
+                    print(f"🎯 [预警] 触碰 {target}! (现价: {current_price})")
                     triggered = True
 
             if triggered:
-                rule['triggered'] = True
+                self.triggered_cache.add(rule_id)
                 is_triggered_any = True
                 self.show_popup(current_price, note, r_type)
 
-        # 只要有报警，必须强行落盘，不管你是看多还是看空
         if is_triggered_any and self.flush_callback:
-            self.flush_callback(reason=f"预警({r_type})")
+            self.flush_callback(reason=f"预警触发")
 
 
 # 初始化全局报警器
 alert_bot = AlertManager(flush_callback=save_to_disk)
 
 
-# ================= 🧮 核心算法 & 历史预热 (保持不变) =================
+# ================= 🧮 下面代码保持不变 =================
+# 为了节省篇幅，下面的 calculate_indicators, init_history,
+# process_message, on_message... 等函数完全不需要动。
+# 请确保你的文件中包含它们。
+
 def calculate_indicators(df):
     if df.empty: return df
     try:
@@ -219,18 +242,17 @@ def init_history():
     print("🚀 预热完毕")
 
 
-# ================= 📡 WebSocket 实时处理 =================
 def process_message(channel, kline):
     tf = channel.replace("candle", "")
     try:
         ts, open_p, high, low, close_p, vol = int(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(
             kline[4]), float(kline[6])
 
-        # 🔥 1. 检查报警 (支持 above, below, reach)
+        # 1. 检查报警 (1m 数据最灵敏，适合做触发源)
         if tf == "1m":
             alert_bot.check_price(close_p)
 
-        # 2. 更新内存
+        # 2. 更新内存 (所有周期都必须更新，不能跳过)
         with DATA_LOCK:
             if tf not in DATA_CACHE: return
             df = DATA_CACHE[tf]
@@ -249,9 +271,16 @@ def process_message(channel, kline):
             df = calculate_indicators(df)
             DATA_CACHE[tf] = df
 
-        now = datetime.now().strftime('%H:%M:%S')
-        rsi_val = df.iloc[-1].get('RSI_14', 0) if not df.empty else 0
-        print(f"⚡ [{now}] {tf:<4} | P: {close_p:<8} | RSI: {rsi_val:.1f}")
+        # 🔥 3. 优化日志打印：只打印 1m 的数据 🔥
+        # 解释：其他周期的价格和 1m 是一样的，重复打印没有意义。
+        # 只要看到 1m 在跳动，就证明连接正常。
+        if tf == "1m":
+            now = datetime.now().strftime('%H:%M:%S')
+            rsi_val = df.iloc[-1].get('RSI_14', 0) if not df.empty else 0
+
+            # 这里我稍微优化了一下格式，让它看起来更像一个仪表盘
+            # \r 可以让某些终端实现原地刷新，但为了兼容性还是用普通 print
+            print(f"⚡ [{now}] {tf:<3} | 💰 {close_p:<8} | RSI: {rsi_val:.1f}")
 
     except Exception as e:
         print(f"❌ 处理异常: {e}")
@@ -275,7 +304,7 @@ def on_open(ws):
 
     def heartbeat():
         while ws.sock and ws.sock.connected:
-            time.sleep(25)
+            time.sleep(5)
             try:
                 ws.send("ping")
             except:
@@ -292,7 +321,7 @@ def start_ws_loop():
                            sslopt={"cert_reqs": ssl.CERT_NONE}, ping_interval=None)
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(1)
 
 
 def writer_loop():

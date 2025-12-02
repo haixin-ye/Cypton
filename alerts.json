@@ -1,21 +1,16 @@
 {
   "enable": true,
-  "alerts": [
+  "rules": [
+
+    [0, "reach", "关键点观察"],
+    [2840, "reach", "关键点观察"],
+    [2815, "reach", "关键点观察"],
 
 
-    {
-      "price": 2785,
-      "type": "reach",
-      "triggered": false,
-      "note": "关键点位触碰提醒！"
-    }
-    ,
-    {
-      "price": 2815,
-      "type": "reach",
-      "triggered": false,
-      "note": "关键点位触碰提醒！"
-    }
+
+
+
+    [10000, "reach", "关键点观察"]
 
 
   ]
