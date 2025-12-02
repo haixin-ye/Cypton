@@ -1,0 +1,22 @@
+{
+  "enable": true,
+  "alerts": [
+
+
+    {
+      "price": 2785,
+      "type": "reach",
+      "triggered": false,
+      "note": "关键点位触碰提醒！"
+    }
+    ,
+    {
+      "price": 2815,
+      "type": "reach",
+      "triggered": false,
+      "note": "关键点位触碰提醒！"
+    }
+
+
+  ]
+}

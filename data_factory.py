@@ -8,206 +8,271 @@ import time
 import threading
 import os
 import sys
+import platform
+import tkinter as tk
+from tkinter import messagebox
 from datetime import datetime
 import config
 
 # ================= 🏗️ 全局内存数据库 =================
-# 格式: { "1m": DataFrame, "5m": DataFrame ... }
 DATA_CACHE = {}
-DATA_LOCK = threading.RLock()  # 读写锁
+DATA_LOCK = threading.RLock()
 
 
-# ================= 🧮 核心算法：特征工程 =================
+# ================= 💾 核心功能：数据落盘 =================
+def save_to_disk(reason="定时"):
+    """将内存数据写入磁盘。reason用于区分触发源。"""
+    if not DATA_CACHE: return
+
+    export_data = {}
+    with DATA_LOCK:
+        for tf, df in DATA_CACHE.items():
+            clean_df = df.fillna(0)
+            export_data[tf] = clean_df.to_dict(orient='records')
+
+    if not export_data: return
+
+    try:
+        temp_file = config.JSON_FILENAME + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f)
+        os.replace(temp_file, config.JSON_FILENAME)
+
+        if reason != "定时":
+            print(f"💾 [强行落盘] 触发原因: {reason} | 文件已更新!")
+    except Exception as e:
+        print(f"❌ 写入失败: {e}")
+
+
+# ================= 🔔 高级预警模块 (支持 Reach) =================
+class AlertManager:
+    def __init__(self, config_file='alerts.json', flush_callback=None):
+        self.config_file = config_file
+        self.last_mtime = 0
+        self.alerts = []
+        self.enabled = True
+        self.check_interval = 2
+        self.last_check_time = 0
+        self.flush_callback = flush_callback
+
+        # 定义 "Reach" 类型的容差范围 (0.1%)
+        # 例如目标 3000，只要价格在 2997~3003 之间就算触碰
+        self.tolerance_pct = 0.0005
+
+        self.load_config()
+
+    def load_config(self):
+        if not os.path.exists(self.config_file): return
+        try:
+            current_mtime = os.path.getmtime(self.config_file)
+            if current_mtime > self.last_mtime:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.enabled = data.get('enable', True)
+                    self.alerts = data.get('alerts', [])
+                self.last_mtime = current_mtime
+                print(f"🔔 [系统] 预警配置已热更新！规则数: {len(self.alerts)}")
+        except Exception as e:
+            print(f"⚠️ 读配置错: {e}")
+
+    def play_sound(self):
+        try:
+            sys_plat = platform.system()
+            if sys_plat == "Windows":
+                import winsound
+                # 这种声音比较像 "核弹来袭" 的紧迫感
+                for _ in range(3):
+                    winsound.Beep(800, 200)
+                    winsound.Beep(1200, 200)
+            elif sys_plat == "Darwin":
+                os.system('afplay /System/Library/Sounds/Glass.aiff')
+            else:
+                print('\a')
+        except:
+            pass
+
+    def show_popup(self, price, note, rule_type):
+        def _popup():
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            self.play_sound()
+
+            # 根据类型给点幽默的提示
+            title = "行情预警"
+            if rule_type == 'reach':
+                msg_head = "🎯 目标已击中 (Touch)!"
+            elif rule_type == 'above':
+                msg_head = "🚀 火箭发射 (Breakout)!"
+            else:
+                msg_head = "📉 瀑布警报 (Breakdown)!"
+
+            msg = f"{msg_head}\n\n当前价格: {price}\n备注: {note}\n\n(已强行保存最新数据)"
+            messagebox.showwarning(title, msg)
+            root.destroy()
+
+        threading.Thread(target=_popup, daemon=True).start()
+
+    def check_price(self, current_price):
+        now = time.time()
+        if now - self.last_check_time > self.check_interval:
+            self.load_config()
+            self.last_check_time = now
+
+        if not self.enabled: return
+
+        is_triggered_any = False
+
+        for rule in self.alerts:
+            if rule.get('triggered', False): continue
+
+            target = rule['price']
+            r_type = rule['type']
+            note = rule.get('note', '')
+
+            triggered = False
+
+            # === 核心判断逻辑 ===
+            if r_type == 'above':
+                if current_price >= target:
+                    print(f"🚀 [预警] 价格冲破 {target}! (现价: {current_price})")
+                    triggered = True
+
+            elif r_type == 'below':
+                if current_price <= target:
+                    print(f"🔻 [预警] 价格跌穿 {target}! (现价: {current_price})")
+                    triggered = True
+
+            elif r_type == 'reach':
+                # "Reach" 判定：计算百分比差距
+                # 如果 abs(现价 - 目标) / 目标 <= 0.001 (0.1%)
+                diff = abs(current_price - target)
+                threshold = target * self.tolerance_pct
+                if diff <= threshold:
+                    print(f"🎯 [预警] 价格触碰 {target} (范围内)! (现价: {current_price})")
+                    triggered = True
+
+            if triggered:
+                rule['triggered'] = True
+                is_triggered_any = True
+                self.show_popup(current_price, note, r_type)
+
+        # 只要有报警，必须强行落盘，不管你是看多还是看空
+        if is_triggered_any and self.flush_callback:
+            self.flush_callback(reason=f"预警({r_type})")
+
+
+# 初始化全局报警器
+alert_bot = AlertManager(flush_callback=save_to_disk)
+
+
+# ================= 🧮 核心算法 & 历史预热 (保持不变) =================
 def calculate_indicators(df):
-    """
-    对传入的 K 线数据进行全量指标计算
-    """
     if df.empty: return df
     try:
-        # 1. MACD
         df.ta.macd(close='close', fast=12, slow=26, signal=9, append=True)
-        # 2. RSI
         df.ta.rsi(close='close', length=14, append=True)
-        # 3. KDJ
         df.ta.kdj(high='high', low='low', close='close', length=9, signal=3, append=True)
-        # 4. 布林带
         df.ta.bbands(close='close', length=20, std=2, append=True)
-        # 5. 成交量均线
         df['VOL_MA_20'] = ta.sma(df['volume'], length=20)
-
-    except Exception as e:
-        # 指标计算偶尔报错不应中断主程序
+    except:
         pass
     return df
 
 
-# ================= 🔌 第一步：历史数据预热 =================
 def init_history():
-    """
-    策略：过量预取 + 尾部截断
-    确保拿到的一定是【包含当前最新K线】的最后 LIMIT 条数据
-    """
-    print(f"⏳ 正在初始化历史数据 (目标: {config.LIMIT} 条, 确保最新)...")
-
+    print(f"⏳ 正在初始化历史数据 (目标: {config.LIMIT} 条)...")
     okx = ccxt.okx({
-        'proxies': {
-            'http': f'http://{config.PROXY_HOST}:{config.PROXY_PORT}',
-            'https': f'http://{config.PROXY_HOST}:{config.PROXY_PORT}'
-        },
+        'proxies': {'http': f'http://{config.PROXY_HOST}:{config.PROXY_PORT}',
+                    'https': f'http://{config.PROXY_HOST}:{config.PROXY_PORT}'},
         'timeout': 20000
     })
-
     for tf in config.TIMEFRAMES:
         print(f"   -> 拉取 {tf} ... ", end="")
         try:
-            # 1. 计算【超量】起始时间
-            # 我们多预留 50% 的时间缓冲，防止中间有停盘/缺数据导致拉不到最新
             duration_seconds = okx.parse_timeframe(tf)
-            # 比如要1000根，我们按1500根的时间跨度去请求
             lookback_count = int(config.LIMIT * 1.5)
-            time_span_ms = duration_seconds * 1000 * lookback_count
-
-            start_timestamp = okx.milliseconds() - time_span_ms
-
+            start_timestamp = okx.milliseconds() - (duration_seconds * 1000 * lookback_count)
             all_ohlcv = []
             current_since = start_timestamp
-
-            # 2. 循环拉取，直到【没有新数据】为止
             while True:
-                # 每次请求 100 条 (OKX 某些接口限制较严，用 100 比较稳，反正循环很快)
-                limit_per_req = 100
-
-                candles = okx.fetch_ohlcv(config.SYMBOL_REST, timeframe=tf, since=current_since, limit=limit_per_req)
-
-                if not candles:
-                    break  # 真的没数据了，退出
-
-                # 数据拼接
+                candles = okx.fetch_ohlcv(config.SYMBOL_REST, timeframe=tf, since=current_since, limit=100)
+                if not candles: break
                 if not all_ohlcv:
                     all_ohlcv = candles
                 else:
                     last_ts = all_ohlcv[-1][0]
-                    # 过滤掉时间戳重复或旧的数据
                     new_candles = [c for c in candles if c[0] > last_ts]
-                    if not new_candles:
-                        break  # 虽然有返回，但都是旧数据，说明到头了
+                    if not new_candles: break
                     all_ohlcv.extend(new_candles)
-
-                # 3. 核心判断：是否已经拉到了"未来"或"现在"？
-                # 如果这次拉回来的数量少于 limit_per_req，说明已经是最后一页了
-                if len(candles) < limit_per_req:
-                    break
-
-                # 更新下次起点
+                if len(candles) < 100: break
                 current_since = all_ohlcv[-1][0] + 1
-                time.sleep(0.05)  # 极短休眠避免触发频率限制
-
-            # 4. 【尾部截断】：只保留最后(最新)的 LIMIT 条
-            if len(all_ohlcv) > config.LIMIT:
-                all_ohlcv = all_ohlcv[-config.LIMIT:]
-
-            if not all_ohlcv:
-                print("❌ 空数据")
-                continue
-
-            # 5. 【时效性校验】：检查最后一条数据的时间是否新鲜
-            last_candle_time = datetime.fromtimestamp(all_ohlcv[-1][0] / 1000)
-            now_time = datetime.now()
-            # 简单打印一下最后一条K线的时间，让你放心
-            time_str = last_candle_time.strftime('%H:%M:%S')
-
-            # 转 DataFrame
+                time.sleep(0.05)
+            if len(all_ohlcv) > config.LIMIT: all_ohlcv = all_ohlcv[-config.LIMIT:]
             df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df = calculate_indicators(df)
-
             with DATA_LOCK:
                 DATA_CACHE[tf] = df
-
-            print(f"✅ 完成 (获 {len(df)} 根 | 最新: {time_str})")
-
+            print(f"✅ 完成 ({len(df)} 根)")
         except Exception as e:
             print(f"❌ 失败: {e}")
+    print("🚀 预热完毕")
 
-    print("🚀 历史数据预热完毕，准备接入实时流...")
 
-# ================= 📡 第二步：WebSocket 实时处理 =================
-
+# ================= 📡 WebSocket 实时处理 =================
 def process_message(channel, kline):
-    """
-    处理单条推送数据
-    """
-    # channel 示例: "candle1m" -> "1m"
     tf = channel.replace("candle", "")
-
     try:
-        # OKX 推送格式解析
-        ts = int(kline[0])
-        open_p = float(kline[1])
-        high = float(kline[2])
-        low = float(kline[3])
-        close_p = float(kline[4])
-        vol = float(kline[6])  # 6 是基础货币数量(ETH), 7 是计价货币(USDT)
+        ts, open_p, high, low, close_p, vol = int(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(
+            kline[4]), float(kline[6])
 
+        # 🔥 1. 检查报警 (支持 above, below, reach)
+        if tf == "1m":
+            alert_bot.check_price(close_p)
+
+        # 2. 更新内存
         with DATA_LOCK:
             if tf not in DATA_CACHE: return
             df = DATA_CACHE[tf]
+            last_ts = df.iloc[-1]['timestamp'] if not df.empty else 0
+            new_row = {'timestamp': ts, 'open': open_p, 'high': high, 'low': low, 'close': close_p, 'volume': vol}
 
-            last_ts = df.iloc[-1]['timestamp']
-
-            new_row = {
-                'timestamp': ts, 'open': open_p, 'high': high, 'low': low,
-                'close': close_p, 'volume': vol
-            }
-
-            # 逻辑：如果是新的一根K线（时间戳变大），append；如果是同一根，update
             if ts > last_ts:
-                # 必须转成 DataFrame 才能 concat
-                new_df_row = pd.DataFrame([new_row])
-                df = pd.concat([df, new_df_row], ignore_index=True)
-                # 保持长度，防止内存溢出
-                if len(df) > config.LIMIT:
-                    df = df.iloc[-config.LIMIT:].reset_index(drop=True)
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                if len(df) > config.LIMIT: df = df.iloc[-config.LIMIT:].reset_index(drop=True)
             elif ts == last_ts:
-                # 更新最后一行
-                df.iloc[-1] = new_row
+                if not df.empty:
+                    df.iloc[-1] = new_row
+                else:
+                    df = pd.DataFrame([new_row])
 
-            # 🔥 核心：每次更新数据后，立即重算指标
-            # (虽然计算量大，但能保证 AI 拿到的是毫秒级最新的指标)
             df = calculate_indicators(df)
             DATA_CACHE[tf] = df
 
-        # ✅ 实时日志：打印到控制台
         now = datetime.now().strftime('%H:%M:%S')
-        # \r 让光标回到行首，实现原地刷新效果，看起来像跳动
-        # 但既然你有多个周期，原地刷新会互相覆盖，所以这里用换行打印更清晰
-        # 或者只打印特定周期的
-        print(f"⚡ [{now}] {tf:<4} | P: {close_p:<8} | V: {int(vol):<5} | RSI: {df.iloc[-1].get('RSI_14', 0):.1f}")
+        rsi_val = df.iloc[-1].get('RSI_14', 0) if not df.empty else 0
+        print(f"⚡ [{now}] {tf:<4} | P: {close_p:<8} | RSI: {rsi_val:.1f}")
 
     except Exception as e:
         print(f"❌ 处理异常: {e}")
 
 
 def on_message(ws, msg):
-    """收到消息的回调"""
-    if msg == "pong": return  # 忽略心跳包
+    if msg == "pong": return
     try:
         data = json.loads(msg)
-        # 检查是否是 K 线数据
-        if 'data' in data and 'arg' in data:
+        if 'data' in data:
             channel = data['arg']['channel']
-            for kline in data['data']:
-                process_message(channel, kline)
+            for kline in data['data']: process_message(channel, kline)
     except:
         pass
 
 
 def on_open(ws):
-    print("\n>>> 🟢 连接成功！发送订阅请求...", flush=True)
-    # 构造订阅参数
+    print("\n>>> 🟢 连接成功！订阅中...")
     args = [{"channel": f"candle{tf}", "instId": config.SYMBOL_WS} for tf in config.TIMEFRAMES]
     ws.send(json.dumps({"op": "subscribe", "args": args}))
 
-    # 启动心跳子线程 (OKX 要求每 25s 发一次 ping)
     def heartbeat():
         while ws.sock and ws.sock.connected:
             time.sleep(25)
@@ -219,81 +284,25 @@ def on_open(ws):
     threading.Thread(target=heartbeat, daemon=True).start()
 
 
-def on_error(ws, error):
-    print(f"⚠️ 连接错误: {error}")
-
-
-def on_close(ws, *args):
-    print("🔌 连接断开")
-
-
 def start_ws_loop():
-    """
-    死循环维护 WebSocket 连接
-    """
     while True:
         try:
-            print(f"\n>>> 正在连接 OKX ({config.WS_URL})...")
-            ws = websocket.WebSocketApp(
-                config.WS_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-            # 阻塞运行
-            ws.run_forever(
-                http_proxy_host=config.PROXY_HOST,
-                http_proxy_port=config.PROXY_PORT,
-                proxy_type="http",
-                sslopt={"cert_reqs": ssl.CERT_NONE},
-                ping_interval=None
-            )
-        except Exception as e:
-            print(f"❌ 启动失败: {e}")
-
-        print("🔁 2秒后尝试重连...")
+            ws = websocket.WebSocketApp(config.WS_URL, on_open=on_open, on_message=on_message)
+            ws.run_forever(http_proxy_host=config.PROXY_HOST, http_proxy_port=config.PROXY_PORT, proxy_type="http",
+                           sslopt={"cert_reqs": ssl.CERT_NONE}, ping_interval=None)
+        except Exception:
+            pass
         time.sleep(2)
 
 
-# ================= 💾 第三步：定时落盘 =================
 def writer_loop():
-    """
-    独立线程：不管 WebSocket 推送多快，我只按固定频率写磁盘。
-    避免 IO 占用过多 CPU。
-    """
-    print("💾 磁盘写入服务启动...")
+    print("💾 定时落盘服务启动...")
     while True:
         time.sleep(config.WRITE_INTERVAL)
-
-        if not DATA_CACHE: continue
-
-        export_data = {}
-        with DATA_LOCK:
-            for tf, df in DATA_CACHE.items():
-                # 转换前做一下清洗，去掉指标计算产生的 NaN
-                clean_df = df.fillna(0)
-                export_data[tf] = clean_df.to_dict(orient='records')
-
-        if not export_data: continue
-
-        try:
-            temp_file = config.JSON_FILENAME + ".tmp"
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f)
-            os.replace(temp_file, config.JSON_FILENAME)
-            # print(f"💾 JSON 已更新 ({len(export_data)} timeframes)")
-        except Exception as e:
-            print(f"❌ 写入失败: {e}")
+        save_to_disk(reason="定时")
 
 
-# ================= 🚀 主入口 =================
 if __name__ == "__main__":
-    # 1. 预热
     init_history()
-
-    # 2. 启动写入线程 (Daemon守护线程，主程序挂了它也挂)
     threading.Thread(target=writer_loop, daemon=True).start()
-
-    # 3. 启动采集主循环 (阻塞)
     start_ws_loop()
